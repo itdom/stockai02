@@ -1,0 +1,463 @@
+SQZ-QuantScanner 数据获取架构阅读笔记
+=====================================
+
+来源项目
+--------
+C:\workspace\vscode\SQZ-QuantScanner
+
+本文总结该项目里“数据获取、落库、指标计算、信号查询”的整体架构和代码写法，供人工阅读和后续重构 AI3 项目时参考。
+
+
+一、总体架构
+------------
+这个项目的行情数据处理是典型的分层流水线：
+
+    外部数据源
+        -> source 层抓取和标准化
+        -> task 层做任务编排
+        -> sink 层写入 MySQL RAW 表
+        -> transform 层计算指标
+        -> sink 层写入 DW 指标表
+        -> strategy dao/service 层查询策略信号
+
+核心目录对应关系：
+
+    common/config.py
+        全局配置，包括 Tushare Token、MySQL 配置、表名映射。
+
+    common/db.py
+        MySQL 连接池，提供 query、execute、executemany。
+
+    pipeline/daily/source/
+        日线 source 层，从 Tushare 或 akshare 抓数据，或者从 MySQL RAW 表读取数据。
+
+    pipeline/daily/task/
+        日线任务编排层，负责日期区间、股票列表、mode 判断、清分区、异常隔离。
+
+    pipeline/daily/sink/
+        日线落库层，负责字段对齐、批量写入、ON DUPLICATE KEY UPDATE。
+
+    pipeline/daily/transform/
+        日线指标计算层，例如 KDJ、EMA、SQZ。
+
+    pipeline/week/
+        周线流水线，结构基本复制 daily，但增加了日线转周线逻辑和周一日期归一规则。
+
+    strategy/dao/
+        SQL 查询层。
+
+    strategy/service/
+        业务服务层，把 dao 查询结果转成策略需要的结构。
+
+
+二、数据源写法
+--------------
+项目主数据源是 Tushare，备用/补充数据源是 akshare。
+
+Tushare 日线主入口在：
+
+    pipeline/daily/source/raw_tushare_source.py
+
+核心函数：
+
+    fetch_stock_list()
+        调用 pro.stock_basic 获取全市场股票列表。
+
+    fetch_raw_daily(...)
+        如果传 trade_date，则调用 pro.daily(trade_date=...) 一次性获取当天全市场日线。
+        如果传 ts_code/start_date/end_date，则调用 ts.pro_bar(...) 获取单只股票区间行情。
+
+    fetch_ma_daily(...)
+        通过 Tushare pro_bar 原生 ma 参数获取 MA 字段。
+
+Tushare 周线入口在：
+
+    pipeline/week/source/raw_tushare_source.py
+
+核心函数：
+
+    fetch_raw_weekly(...)
+        调用 ts.pro_bar(freq="W") 获取周线。
+        返回后会把 Tushare 周线日期转换为该周周一日期，统一作为 trade_date。
+
+akshare 备用入口在：
+
+    pipeline/daily/source/raw_sina_source.py
+
+核心函数：
+
+    fetch_stock_basic()
+    fetch_trade_calendar()
+    fetch_stock_daily(...)
+    fetch_adj_factor(...)
+    fetch_index_daily(...)
+
+source 层的共同特点：
+
+    1. 返回 pandas.DataFrame。
+    2. 空数据返回空 DataFrame，不直接让全市场任务崩溃。
+    3. 字段尽量统一为 ts_code、trade_date、open、high、low、close、vol、amount 等。
+    4. trade_date 统一为 YYYYMMDD。
+    5. 行情按 trade_date 升序排序。
+    6. source 层只做数据获取和标准化，不计算 KDJ/EMA/SQZ。
+
+
+三、数据库与表名
+----------------
+项目使用 MySQL，连接池在：
+
+    common/db.py
+
+主要接口：
+
+    mysql_client.query(sql, params=None)
+    mysql_client.execute(sql, params=None)
+    mysql_client.executemany(sql, params_list)
+
+表名映射集中在 common/config.py 的 TABLES：
+
+    MARKET_DAILY      -> raw_market_p
+    BASE_STOCK_LIST   -> raw_base_stock_list
+    MARKET_MA         -> raw_market_ma
+    DW_SQZ            -> dw_sqz_p
+    DW_KDJ            -> dw_kdj_p
+    DWS_EMA           -> dw_ema_p
+    MARKET_WEEKLY     -> raw_market_week_p
+    DW_SQZ_WEEK       -> dw_sqz_week_p
+    DW_KDJ_WEEK       -> dw_kdj_week_p
+    DWS_EMA_WEEK      -> dw_ema_week_p
+
+重要提醒：
+
+    参考项目 common/config.py 中存在硬编码 Token 和数据库密码。
+    AI3 后续实现时不要照抄这一点。
+    Token 必须从环境变量 TUSHARE_TOKEN 读取。
+    数据库密码也应从环境变量或本地 .env 读取，并避免提交真实值。
+
+
+四、RAW 日线任务
+----------------
+日线 RAW 任务在：
+
+    pipeline/daily/task/raw_daily_task.py
+
+核心类：
+
+    RawDailyTask
+
+核心方法：
+
+    run_all_raw_daily(...)
+        全市场 RAW 日线任务入口。
+
+    run_all_raw_daily_by_date(...)
+        按日期循环，每天调用一次 fetch_raw_daily(trade_date=d)，一次性获取当天全市场数据。
+
+    run_single(...)
+        按单只股票抓取，适合局部补数据。
+
+任务支持的 mode：
+
+    increment
+        从数据库中该股票最大 trade_date 之后开始。
+
+    all
+        全量。
+
+    t1
+        昨日。
+
+    date
+        指定单日。
+
+    range
+        指定区间。
+
+全市场默认逻辑：
+
+    1. 校验 start_date/end_date。
+    2. 清理 raw_market_p 对应日期分区。
+    3. 按日期循环抓取全市场行情。
+    4. 将 np.nan 替换为 None。
+    5. 查询目标表字段。
+    6. 只保留目标表存在的列。
+    7. 批量写入 MySQL。
+
+这个写法的好处是：
+
+    1. 按日期抓全市场比逐股票调用 API 更省次数。
+    2. 任务层统一清分区，可以避免 sink 层误删其他股票数据。
+    3. 单日无数据只跳过，不影响整个区间。
+
+
+五、RAW 周线任务
+----------------
+周线 RAW 任务在：
+
+    pipeline/week/task/raw_daily_task.py
+
+核心类：
+
+    RawWeeklyTask
+
+核心函数：
+
+    fetch_raw_weekly(...)
+
+周线数据有两个来源思路：
+
+    1. 直接调用 Tushare pro_bar(freq="W") 获取周线。
+    2. 从日线 RAW 聚合为周线。
+
+项目中直接周线抓取会把 trade_date 归一到周一：
+
+    Tushare 返回的周线日期
+        -> 转为 datetime
+        -> 减去 weekday 天数
+        -> 得到该周周一 YYYYMMDD
+        -> 作为 trade_date
+
+周线指标任务中也有日线转周线：
+
+    pipeline/week/source/base_source.py
+
+核心函数：
+
+    convert_daily_to_weekly(df)
+
+聚合规则：
+
+    open   = 本周第一根日线 open
+    high   = 本周最高 high
+    low    = 本周最低 low
+    close  = 本周最后一根日线 close
+    vol    = 本周成交量合计
+    amount = 本周成交额合计
+
+注意：
+
+    周线 trade_date 必须统一为周一，否则周线 RAW、周线 KDJ、周线信号查询会对不上。
+
+
+六、sink 层写法
+---------------
+日线 RAW sink 在：
+
+    pipeline/daily/sink/raw_sink.py
+
+周线 RAW sink 在：
+
+    pipeline/week/sink/raw_sink.py
+
+关键函数：
+
+    load_raw_daily_dynamic_partition(df, table_name, overwrite=True)
+
+核心写入策略：
+
+    1. 如果 df 为空，直接返回 0。
+    2. 查询目标表字段：SHOW COLUMNS FROM table_name。
+    3. 找出 df.columns 和 table columns 的交集。
+    4. df = df[cols].replace({np.nan: None})。
+    5. df.to_dict(orient="records")。
+    6. 构造 INSERT SQL。
+    7. overwrite=True 时使用 ON DUPLICATE KEY UPDATE。
+    8. overwrite=False 时使用 INSERT IGNORE。
+
+重要设计：
+
+    sink 层不负责清分区。
+    清分区必须由 task 层集中调用。
+    原因是单只股票写入时如果清空 pYYYYMMDD 分区，会把同一天其他股票的数据一起删掉。
+
+分区清理函数在：
+
+    pipeline/daily/sink/base_sink.py
+    pipeline/week/sink/base_sink.py
+
+函数名：
+
+    truncate_partitions(table_name, t_start, t_end)
+
+分区命名：
+
+    pYYYYMMDD
+
+
+七、指标计算链路
+----------------
+指标任务遵循：
+
+    RAW 行情表
+        -> get_market_daily_list(...)
+        -> transform 计算指标
+        -> 截取目标区间
+        -> DW sink 批量写入
+
+KDJ 计算在：
+
+    pipeline/daily/transform/kdj_transform.py
+
+核心函数：
+
+    calc_kdj_gm_v2(df, ilong=9, isig=3)
+
+输入要求：
+
+    ts_code
+    trade_date
+    high
+    low
+    close
+
+输出字段：
+
+    kdj_k
+    kdj_d
+    kdj_j
+
+KDJ 写法特点：
+
+    1. trade_date 先统一为 int。
+    2. RSV = 100 * (close - rolling_low) / (rolling_high - rolling_low)。
+    3. K/D 使用类似 PineScript 的逐 bar 状态机 bcwsma。
+    4. J = 3K - 2D。
+    5. 计算前必须按 trade_date 升序。
+    6. 区间计算必须预加载历史窗口，然后只保存目标区间。
+
+日线 KDJ 任务在：
+
+    pipeline/daily/task/dws_kdj_task.py
+
+周线 KDJ 任务在：
+
+    pipeline/week/task/dws_kdj_task.py
+
+日线 KDJ 预加载：
+
+    preload_days = ilong * 4
+
+周线 KDJ 预加载：
+
+    preload_days = ilong * 20
+
+全市场指标任务写法：
+
+    1. 获取股票列表。
+    2. 清理目标 DW 表日期分区。
+    3. 循环每只股票，读取 RAW 数据。
+    4. 计算指标。
+    5. 每只股票失败只记录错误，不中断整体任务。
+    6. 把所有股票结果 concat。
+    7. 一次性批量写入 DW 表。
+
+
+八、信号查询
+------------
+KDJ 信号查询在：
+
+    strategy/dao/kdj_dao.py
+    strategy/service/kdj_service.py
+
+日线 KDJ 金叉查询逻辑：
+
+    当前交易日 t2
+    上一有效交易日 t1 = 当前股票小于 t2.trade_date 的最大 trade_date
+
+    条件：
+        t1.kdj_k < t1.kdj_d
+        t2.kdj_k >= t2.kdj_d
+
+周线 KDJ 金叉查询逻辑：
+
+    当前周：指定日期所在周的最大 trade_date
+    上一周：小于当前周最小 trade_date 的最大 trade_date
+
+    条件：
+        上一周 kdj_k < kdj_d
+        当前周 kdj_k >= kdj_d
+
+注意：
+
+    不要假设自然日连续。
+    A 股有节假日，必须找上一有效交易日或上一有效周。
+
+
+九、后续在 AI3 中建议采用的写法
+-------------------------------
+AI3 项目可以直接吸收以下模式：
+
+    1. common/config.py 统一读取环境变量和表名。
+    2. common/db.py 封装 DB client。
+    3. pipeline/daily/source 只做数据获取。
+    4. pipeline/daily/sink 只做落库。
+    5. pipeline/daily/task 负责调度、清分区、异常隔离。
+    6. pipeline/week 复用 daily 结构。
+    7. transform 层禁止访问外部 API 和数据库。
+    8. service 层只对外提供策略需要的接口。
+
+AI3 的核心策略是“周线 KDJ 金叉后持有 5/10/20/60 个交易日收益统计”，建议数据准备链路为：
+
+    1. 更新股票列表。
+    2. 抓取或补齐日线 RAW。
+    3. 生成周线 RAW，或者直接抓取周线 RAW。
+    4. 计算周线 KDJ。
+    5. 查询周线 KDJ 金叉日期。
+    6. 从日线 RAW 中找买入日之后第 5/10/20/60 个交易日的收盘价。
+    7. 统计收益率、胜率、平均收益、中位数、最大回撤等。
+
+
+十、必须避免的问题
+------------------
+参考项目中有一些后续应该改进的点：
+
+    1. 不要硬编码 Tushare Token。
+    2. 不要硬编码数据库密码。
+    3. 不要让 source 层和 transform 层混在一起。
+    4. 不要在 sink 写单只股票时清空整天分区。
+    5. 不要让周线 trade_date 有时是周五、有时是周一。
+    6. 不要用自然日减法当作上一交易日。
+    7. 不要忽略 DataFrame 字段和表字段对齐。
+    8. 不要把真实行情 CSV、大日志、数据库导出提交进版本库。
+
+
+十一、最小代码骨架
+------------------
+后续新建数据获取模块时，可以按以下骨架写：
+
+    def fetch_raw_daily(ts_code=None, start_date=None, end_date=None, trade_date=None) -> pd.DataFrame:
+        # 1. 调用外部 API
+        # 2. 空数据返回 pd.DataFrame()
+        # 3. 统一字段
+        # 4. trade_date 转 YYYYMMDD
+        # 5. sort_values("trade_date")
+        # 6. drop_duplicates(...)
+        # 7. return df
+
+    def run_all_raw_daily(start_date, end_date, stocks=None):
+        # 1. task 层校验日期
+        # 2. task 层清分区
+        # 3. source 抓取
+        # 4. 字段对齐
+        # 5. sink 批量写入
+        # 6. 单只失败记录日志并继续
+
+    def load_raw_daily_dynamic_partition(df, table_name, overwrite=True):
+        # 1. 空 df 跳过
+        # 2. SHOW COLUMNS
+        # 3. 只保留匹配字段
+        # 4. np.nan -> None
+        # 5. INSERT ... ON DUPLICATE KEY UPDATE
+
+
+十二、结论
+----------
+SQZ-QuantScanner 的核心价值不在 UI 或零散脚本，而在它已经形成了一套可复用的数据工程模式：
+
+    source 负责抓取和标准化。
+    task 负责业务编排。
+    sink 负责幂等写入。
+    transform 负责无副作用计算。
+    dao/service 负责策略读取。
+
+AI3 后续实现 A 股全市场周线 KDJ 回测时，应优先复用这套边界清晰的分层方式。

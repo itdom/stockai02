@@ -1,6 +1,8 @@
 # Python cache files
 __pycache__/
 *.py[cod]
+.pytest_cache/
+pytest-cache-files-*/
 
 # Virtual environments
 .venv/
@@ -11,6 +13,7 @@ env/
 .env
 
 # Editor and OS files
+.codex/
 .vscode/
 .idea/
 .DS_Store
